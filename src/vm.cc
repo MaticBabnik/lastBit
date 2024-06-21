@@ -1,5 +1,5 @@
 #include "vm.hh"
-#include <immintrin.h>
+#include "simd.hh"
 
 using namespace std;
 
@@ -8,50 +8,26 @@ constexpr auto IN_REG_A  = 17;
 constexpr auto OUT_REG   = 18;
 constexpr auto OUT_REG_A = 19;
 
-uint16_t get16(uint8_t *p) {
-    // This actually reverses bytes in a vector, trust me
-    const __m128i shuffle_reverse =
-        _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-
-    __m128i vec16 = _mm_loadu_si128((__m128i *)p);
-
-    // Shift the bits up, so movemask sees them
-    vec16 = _mm_slli_epi16(vec16, 7);
-
-    // flip order of bytes (later bits)
-    vec16 = _mm_shuffle_epi8(vec16, shuffle_reverse);
-
-    return _mm_movemask_epi8(vec16); // extract u16
+const char *hexab = "0123456789ABCDEF";
+void        debugState(uint8_t w[128]) {
+    for (int i = 0; i < 32; i++) {
+        uint8_t hc = 0;
+        for (int j = 0; j < 4; j++) {
+            hc <<= 1;
+            hc |= w[4 * i + j];
+        }
+        cout << hexab[hc];
+    }
+    cout << endl;
 }
 
-void set16(uint8_t *p, uint16_t data) {
-    const __m128i extract_bits = _mm_set_epi8(
-        0x1,
-        0x2,
-        0x4,
-        0x8,
-        0x10,
-        0x20,
-        0x40,
-        0x80,
-        0x1,
-        0x2,
-        0x4,
-        0x8,
-        0x10,
-        0x20,
-        0x40,
-        0x80
-    );
+bool RegState::operator==(const RegState &other) const {
+    return data[0] == other.data[0] && data[1] == other.data[1];
+}
 
-    uint8_t b = data, t = data >> 8; // split u16
-
-    // load top and bottom half
-    __m128i vec = _mm_set_epi8(b, b, b, b, b, b, b, b, t, t, t, t, t, t, t, t);
-    // check if respective bit is set
-    vec = _mm_min_epu8(_mm_and_si128(vec, extract_bits), _mm_set1_epi8(1));
-    // store
-    _mm_storeu_si128((__m128i *)p, vec);
+size_t RegHash::operator()(const RegState &key) const {
+    return std::hash<uint64_t>()(key.data[0])
+           ^ (std::hash<uint64_t>()(key.data[1]) << 1);
 }
 
 OneBitMachine::OneBitMachine(
@@ -62,18 +38,16 @@ OneBitMachine::OneBitMachine(
     : inCb(in), outCb(out), rom(prog) {
     regFile[IN_REG_A] = 1;
     regFile[IN_REG]   = inCb() ? 1 : 0;
+
+    createEcb(getState());
 }
 
 void OneBitMachine::icopy(uint8_t a, uint8_t b) {
-    _mm_storeu_si128(
-        (__m128i *)(this->regFile + b),
-        _mm_loadu_si128((__m128i *)(regFile + a))
-    );
-    // set16(this->regFile + b, get16(this->regFile + a));
+    copy16(this->regFile + b, regFile + a);
 }
 
 void OneBitMachine::iload(uint8_t a, uint8_t b) {
-    set16(this->regFile + b, this->rom[a]);
+    unpack16(this->regFile + b, this->rom[a]);
 }
 
 void OneBitMachine::inand(uint8_t a, uint8_t b) {
@@ -84,24 +58,18 @@ void OneBitMachine::ixor(uint8_t a, uint8_t b) {
     this->regFile[b] = 1 & (this->regFile[a] ^ this->regFile[b]);
 }
 
-const char *hexab = "0123456789ABCDEF";
-
-void debugState(uint8_t w[128]) {
-    for (int i = 0; i < 32; i++) {
-        uint8_t hc = 0;
-        for (int j = 0; j < 4; j++) {
-            hc <<= 1;
-            hc |= w[4 * i + j];
-        }
-        cout << hexab[hc];
-    }
-    cout<<endl;
-}
-
 void OneBitMachine::go() {
+    if (!this->ecb.has_value()) {
+        auto it = cache.find(getState());
+        if (it != cache.end()) {
+            runCached(it->second);
+            return;
+        }
+    }
+
     // increment PC
-    auto oldPc = get16(this->regFile);
-    set16(this->regFile, oldPc + 1);
+    auto oldPc = pack16(this->regFile);
+    unpack16(this->regFile, oldPc + 1);
 
     // decode
     auto inst = this->rom[oldPc];
@@ -125,7 +93,7 @@ void OneBitMachine::go() {
         break;
     }
 
-    auto newPc = get16(this->regFile);
+    auto newPc = pack16(this->regFile);
 
     if (oldPc == newPc) {
         cout << "HALT" << endl;
@@ -135,11 +103,62 @@ void OneBitMachine::go() {
     // handle IO
     if (this->regFile[OUT_REG_A]) {
         this->outCb(this->regFile[OUT_REG]);
+        if (this->ecb.has_value()) {
+            this->ecb->io.emplace_back(this->regFile[OUT_REG]);
+        }
         this->regFile[OUT_REG_A] = 0;
     }
-
     if (!this->regFile[IN_REG_A]) {
         this->regFile[IN_REG]   = inCb();
         this->regFile[IN_REG_A] = 1;
+        // todo: is this even cachable?
     }
+
+    if (oldPc + 1 != newPc) {
+        auto newState = getState();
+
+        finishEcb(newState); // finish current ecb (if it)
+
+        if (cache.contains(newState)) {
+            this->ecb.reset();
+        } else {
+            createEcb(newState);
+        }
+    }
+}
+
+void OneBitMachine::runCached(const ExecutionCacheBlock &c) {
+    for (bool b : c.io) {
+        outCb(b);
+    }
+
+    auto w = c.end.data[0];
+    unpack32(regFile, w);
+    unpack32(regFile + 32, w >> 32);
+
+    w = c.end.data[1];
+    unpack32(regFile + 64, w);
+    unpack32(regFile + 96, w >> 32);
+}
+
+RegState OneBitMachine::getState() {
+    RegState o;
+    o.data[0] =
+        ((uint64_t)pack32(regFile + 32) << 32) | (uint64_t)pack32(regFile);
+    o.data[1] =
+        ((uint64_t)pack32(regFile + 96) << 32) | (uint64_t)pack32(regFile + 64);
+    return o;
+}
+
+void OneBitMachine::createEcb(RegState rs) {
+    ecb.emplace();
+    ecb->start = getState();
+}
+
+void OneBitMachine::finishEcb(RegState rs) {
+    if (!ecb.has_value()) return;
+
+    ecb->end = rs;
+
+    this->cache.emplace(ecb->start, ecb.value());
 }
