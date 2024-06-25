@@ -25,6 +25,13 @@ bool RegState::operator==(const RegState &other) const {
     return data[0] == other.data[0] && data[1] == other.data[1];
 }
 
+bool RegState::operator<(const RegState &other) const {
+    if (data[0] == other.data[0]) {
+        return data[1] < other.data[1];
+    }
+    return (data[0] < other.data[0]);
+}
+
 size_t RegHash::operator()(const RegState &key) const {
     return std::hash<uint64_t>()(key.data[0])
            ^ (std::hash<uint64_t>()(key.data[1]) << 1);

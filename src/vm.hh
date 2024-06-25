@@ -8,7 +8,9 @@
 
 struct RegState {
     uint64_t data[2];
-    bool     operator==(const RegState &other) const;
+
+    bool operator==(const RegState &other) const;
+    bool operator<(const RegState &other) const;
 };
 
 struct RegHash {
@@ -39,7 +41,9 @@ class OneBitMachine {
     std::function<bool()>     inCb;
     std::function<void(bool)> outCb;
 
+    // TODO: pick one? performance seems to be about the same?
     std::unordered_map<RegState, ExecutionCacheBlock, RegHash> cache{};
+    // std::map<RegState, ExecutionCacheBlock> cache{};
 
     std::optional<ExecutionCacheBlock> ecb{};
 
